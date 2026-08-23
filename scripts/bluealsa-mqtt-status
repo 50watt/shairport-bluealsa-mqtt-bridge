@@ -1,0 +1,337 @@
+#!/usr/bin/env bash
+
+# Publish Bluetooth, BlueALSA, and Shairport Sync health data to MQTT.
+
+set -u
+
+SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIRECTORY
+readonly COMMON_LIBRARY="${BRIDGE_COMMON_LIB:-${SCRIPT_DIRECTORY}/../lib/common.sh}"
+
+if [[ ! -r "${COMMON_LIBRARY}" ]]; then
+    printf 'Common library is not readable: %s\n' "${COMMON_LIBRARY}" >&2
+    exit 1
+fi
+
+# shellcheck source=../lib/common.sh
+source "${COMMON_LIBRARY}"
+
+load_configuration || exit 1
+require_commands \
+    awk \
+    bluealsa-cli \
+    bluetoothctl \
+    busctl \
+    date \
+    grep \
+    mosquitto_pub \
+    systemctl \
+    timeout || exit 1
+
+last_connected=""
+last_state=""
+last_device=""
+last_profile=""
+last_volume=""
+last_muted=""
+last_audio_running=""
+last_delay_ms=""
+last_sequence=""
+last_rssi=""
+last_link_quality=""
+last_shairport_state=""
+last_shairport_restarts=""
+last_heartbeat_epoch=0
+last_detail_epoch=0
+last_pcm_path=""
+
+current_volume="unavailable"
+current_muted="unavailable"
+current_delay_ms="unavailable"
+current_sequence="unavailable"
+current_rssi="unavailable"
+current_link_quality="unavailable"
+
+reset_pcm_details() {
+    current_volume="unavailable"
+    current_muted="unavailable"
+    current_delay_ms="unavailable"
+    current_sequence="unavailable"
+}
+
+reset_radio_details() {
+    current_rssi="unavailable"
+    current_link_quality="unavailable"
+}
+
+publish_snapshot() {
+    publish_mqtt_value "${MQTT_STATUS_CLIENT_ID}" "connected" "${current_connected}" &&
+    publish_mqtt_value "${MQTT_STATUS_CLIENT_ID}" "state" "${current_state}" &&
+    publish_mqtt_value "${MQTT_STATUS_CLIENT_ID}" "device" "${current_device}" &&
+    publish_mqtt_value "${MQTT_STATUS_CLIENT_ID}" "profile" "${current_profile}" &&
+    publish_mqtt_value "${MQTT_STATUS_CLIENT_ID}" "volume" "${current_volume}" &&
+    publish_mqtt_value "${MQTT_STATUS_CLIENT_ID}" "muted" "${current_muted}" &&
+    publish_mqtt_value "${MQTT_STATUS_CLIENT_ID}" "audio-running" "${current_audio_running}" &&
+    publish_mqtt_value "${MQTT_STATUS_CLIENT_ID}" "delay-ms" "${current_delay_ms}" &&
+    publish_mqtt_value "${MQTT_STATUS_CLIENT_ID}" "sequence" "${current_sequence}" &&
+    publish_mqtt_value "${MQTT_STATUS_CLIENT_ID}" "rssi" "${current_rssi}" &&
+    publish_mqtt_value "${MQTT_STATUS_CLIENT_ID}" "link-quality" "${current_link_quality}" &&
+    publish_mqtt_value "${MQTT_STATUS_CLIENT_ID}" "shairport-state" "${current_shairport_state}" &&
+    publish_mqtt_value "${MQTT_STATUS_CLIENT_ID}" "shairport-restarts" "${current_shairport_restarts}"
+}
+
+determine_shairport_state() {
+    current_shairport_state="stopped"
+    current_shairport_restarts="unavailable"
+
+    if systemctl is-active --quiet "${SHAIRPORT_SERVICE}"; then
+        current_shairport_state="running"
+    fi
+
+    current_shairport_restarts="$(
+        systemctl show \
+            "${SHAIRPORT_SERVICE}" \
+            --property=NRestarts \
+            --value \
+            2>/dev/null ||
+        true
+    )"
+
+    if ! [[ "${current_shairport_restarts}" =~ ^[0-9]+$ ]]; then
+        current_shairport_restarts="unavailable"
+    fi
+}
+
+update_pcm_details() {
+    local pcm_path="$1"
+    local current_epoch="$2"
+    local delay_raw=""
+    local volume_property=""
+    local decoded_volume=""
+
+    if ((current_epoch - last_detail_epoch < DETAIL_INTERVAL)); then
+        return
+    fi
+
+    delay_raw="$(read_pcm_property "${pcm_path}" Delay q)"
+    current_sequence="$(read_pcm_property "${pcm_path}" Sequence u)"
+    volume_property="$(read_pcm_property_raw "${pcm_path}" Volume)"
+
+    if [[ "${delay_raw}" =~ ^[0-9]+$ ]]; then
+        current_delay_ms="$(
+            printf '%d.%d' \
+                "$((delay_raw / 10))" \
+                "$((delay_raw % 10))"
+        )"
+    else
+        current_delay_ms="unavailable"
+    fi
+
+    if ! [[ "${current_sequence}" =~ ^[0-9]+$ ]]; then
+        current_sequence="unavailable"
+    fi
+
+    if decoded_volume="$(decode_volume_property "${volume_property}")"; then
+        read -r current_volume current_muted <<<"${decoded_volume}"
+    else
+        current_volume="unavailable"
+        current_muted="unavailable"
+    fi
+
+    last_detail_epoch="${current_epoch}"
+}
+
+update_radio_details() {
+    local current_epoch="$1"
+    local rssi_output=""
+    local link_quality_output=""
+
+    if [[ "${ENABLE_HCI_METRICS}" != "true" ]]; then
+        reset_radio_details
+        return
+    fi
+
+    if ! command -v hcitool >/dev/null 2>&1; then
+        reset_radio_details
+        return
+    fi
+
+    if ((current_epoch - last_radio_epoch < DETAIL_INTERVAL)); then
+        return
+    fi
+
+    rssi_output="$(
+        timeout 5 hcitool -i "${BLUETOOTH_ADAPTER}" rssi "${SPEAKER_MAC}" \
+            2>/dev/null ||
+        true
+    )"
+
+    link_quality_output="$(
+        timeout 5 hcitool -i "${BLUETOOTH_ADAPTER}" lq "${SPEAKER_MAC}" \
+            2>/dev/null ||
+        true
+    )"
+
+    current_rssi="$(
+        sed -nE 's/^RSSI return value:[[:space:]]*(-?[0-9]+)$/\1/p' \
+            <<<"${rssi_output}" |
+        head -n 1
+    )"
+
+    current_link_quality="$(
+        sed -nE 's/^Link quality:[[:space:]]*([0-9]+)$/\1/p' \
+            <<<"${link_quality_output}" |
+        head -n 1
+    )"
+
+    if ! [[ "${current_rssi}" =~ ^-?[0-9]+$ ]]; then
+        current_rssi="unavailable"
+    fi
+
+    if ! [[ "${current_link_quality}" =~ ^[0-9]+$ ]]; then
+        current_link_quality="unavailable"
+    fi
+
+    last_radio_epoch="${current_epoch}"
+}
+
+determine_state() {
+    local current_epoch="$1"
+    local pcm_path=""
+    local running_property=""
+
+    current_connected="0"
+    current_state="disconnected"
+    current_device="${SPEAKER_NAME}"
+    current_profile="none"
+    current_audio_running="0"
+
+    determine_shairport_state
+
+    if ! systemctl is-active --quiet "${BLUETOOTH_SERVICE}"; then
+        current_state="bluetooth-unavailable"
+        reset_pcm_details
+        reset_radio_details
+        last_pcm_path=""
+        last_detail_epoch=0
+        last_radio_epoch=0
+        return
+    fi
+
+    if ! speaker_is_connected; then
+        reset_pcm_details
+        reset_radio_details
+        last_pcm_path=""
+        last_detail_epoch=0
+        last_radio_epoch=0
+        return
+    fi
+
+    current_connected="1"
+    current_state="connected"
+    update_radio_details "${current_epoch}"
+
+    if ! systemctl is-active --quiet "${BLUEALSA_SERVICE}"; then
+        current_state="bluealsa-unavailable"
+        reset_pcm_details
+        last_pcm_path=""
+        last_detail_epoch=0
+        return
+    fi
+
+    pcm_path="$(find_pcm_path || true)"
+
+    if [[ -z "${pcm_path}" ]]; then
+        current_state="connected-no-audio"
+        reset_pcm_details
+        last_pcm_path=""
+        last_detail_epoch=0
+        return
+    fi
+
+    if [[ "${pcm_path}" != "${last_pcm_path}" ]]; then
+        reset_pcm_details
+        last_pcm_path="${pcm_path}"
+        last_detail_epoch=0
+    fi
+
+    current_profile="a2dp"
+    current_state="audio-ready"
+
+    running_property="$(read_pcm_property "${pcm_path}" Running b)"
+
+    if [[ "${running_property}" == "true" ]]; then
+        current_audio_running="1"
+        current_state="streaming"
+    fi
+
+    update_pcm_details "${pcm_path}" "${current_epoch}"
+}
+
+snapshot_has_changed() {
+    [[ "${current_connected}" != "${last_connected}" ]] ||
+    [[ "${current_state}" != "${last_state}" ]] ||
+    [[ "${current_device}" != "${last_device}" ]] ||
+    [[ "${current_profile}" != "${last_profile}" ]] ||
+    [[ "${current_volume}" != "${last_volume}" ]] ||
+    [[ "${current_muted}" != "${last_muted}" ]] ||
+    [[ "${current_audio_running}" != "${last_audio_running}" ]] ||
+    [[ "${current_delay_ms}" != "${last_delay_ms}" ]] ||
+    [[ "${current_sequence}" != "${last_sequence}" ]] ||
+    [[ "${current_rssi}" != "${last_rssi}" ]] ||
+    [[ "${current_link_quality}" != "${last_link_quality}" ]] ||
+    [[ "${current_shairport_state}" != "${last_shairport_state}" ]] ||
+    [[ "${current_shairport_restarts}" != "${last_shairport_restarts}" ]]
+}
+
+remember_snapshot() {
+    last_connected="${current_connected}"
+    last_state="${current_state}"
+    last_device="${current_device}"
+    last_profile="${current_profile}"
+    last_volume="${current_volume}"
+    last_muted="${current_muted}"
+    last_audio_running="${current_audio_running}"
+    last_delay_ms="${current_delay_ms}"
+    last_sequence="${current_sequence}"
+    last_rssi="${current_rssi}"
+    last_link_quality="${current_link_quality}"
+    last_shairport_state="${current_shairport_state}"
+    last_shairport_restarts="${current_shairport_restarts}"
+}
+
+publish_availability_offline() {
+    publish_mqtt_value "${MQTT_STATUS_CLIENT_ID}" "availability" "offline" || true
+}
+
+trap publish_availability_offline EXIT
+
+publish_mqtt_value "${MQTT_STATUS_CLIENT_ID}" "availability" "online" || true
+
+last_radio_epoch=0
+
+while true; do
+    current_epoch="$(date +%s)"
+    determine_state "${current_epoch}"
+
+    if snapshot_has_changed; then
+        if publish_snapshot; then
+            log_info \
+                "Status published: connected=${current_connected}, state=${current_state}, audio_running=${current_audio_running}, rssi=${current_rssi}, link_quality=${current_link_quality}, shairport=${current_shairport_state}, restarts=${current_shairport_restarts}"
+            remember_snapshot
+        else
+            log_error "MQTT publication failed; the snapshot will be retried."
+        fi
+    fi
+
+    if ((current_epoch - last_heartbeat_epoch >= HEARTBEAT_INTERVAL)); then
+        if publish_mqtt_value \
+            "${MQTT_STATUS_CLIENT_ID}" \
+            "heartbeat" \
+            "${current_epoch}"; then
+            last_heartbeat_epoch="${current_epoch}"
+        fi
+    fi
+
+    sleep "${POLL_INTERVAL}"
+done

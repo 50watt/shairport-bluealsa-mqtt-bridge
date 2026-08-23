@@ -1,0 +1,20 @@
+[Unit]
+Description=Reconnect the configured Bluetooth audio device
+Documentation=man:bluetoothctl(1)
+Wants=bluetooth.service bluealsa.service
+After=bluetooth.service bluealsa.service
+
+[Service]
+Type=oneshot
+Environment=BRIDGE_COMMON_LIB=/usr/local/lib/shairport-bluealsa-mqtt-bridge/common.sh
+ExecStart=/usr/local/sbin/bluetooth-reconnect
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_BLUETOOTH

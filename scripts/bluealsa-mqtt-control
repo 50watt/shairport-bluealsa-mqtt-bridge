@@ -1,0 +1,415 @@
+#!/usr/bin/env bash
+
+# Execute a strict allowlist of Bluetooth audio commands received over MQTT.
+
+set -u
+
+SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIRECTORY
+readonly COMMON_LIBRARY="${BRIDGE_COMMON_LIB:-${SCRIPT_DIRECTORY}/../lib/common.sh}"
+
+if [[ ! -r "${COMMON_LIBRARY}" ]]; then
+    printf 'Common library is not readable: %s\n' "${COMMON_LIBRARY}" >&2
+    exit 1
+fi
+
+# shellcheck source=../lib/common.sh
+source "${COMMON_LIBRARY}"
+
+load_configuration || exit 1
+require_commands \
+    bluealsa-cli \
+    bluetoothctl \
+    date \
+    grep \
+    head \
+    mosquitto_pub \
+    mosquitto_sub \
+    sed \
+    sleep \
+    systemctl \
+    timeout || exit 1
+
+last_recovery_epoch=0
+
+require_pcm_path() {
+    current_pcm_path="$(find_pcm_path || true)"
+
+    if [[ -z "${current_pcm_path}" ]]; then
+        log_error "The A2DP PCM path for ${SPEAKER_NAME} is not available."
+        return 1
+    fi
+}
+
+change_volume() {
+    local direction="$1"
+    local volume_information=""
+    local current_volume=""
+    local new_volume=""
+
+    require_pcm_path || return 1
+
+    volume_information="$(
+        timeout 5 bluealsa-cli volume "${current_pcm_path}"
+    )"
+
+    current_volume="$(
+        sed -nE \
+            's/^Volume:[[:space:]]+L:[[:space:]]*([0-9]+).*/\1/p' \
+            <<<"${volume_information}" |
+        head -n 1
+    )"
+
+    if ! [[ "${current_volume}" =~ ^[0-9]+$ ]]; then
+        log_error "The current volume could not be determined."
+        return 1
+    fi
+
+    case "${direction}" in
+        up)
+            new_volume=$((current_volume + VOLUME_STEP))
+            if ((new_volume > VOLUME_MAX)); then
+                new_volume="${VOLUME_MAX}"
+            fi
+            ;;
+        down)
+            new_volume=$((current_volume - VOLUME_STEP))
+            if ((new_volume < 0)); then
+                new_volume=0
+            fi
+            ;;
+        *)
+            log_error "Invalid volume direction: ${direction}"
+            return 1
+            ;;
+    esac
+
+    if timeout 5 bluealsa-cli volume \
+        "${current_pcm_path}" \
+        "${new_volume}" \
+        "${new_volume}"; then
+        log_info "Volume changed: ${current_volume} -> ${new_volume}"
+    else
+        log_error "Failed to change the volume."
+        return 1
+    fi
+}
+
+read_mute_state() {
+    local pcm_path="$1"
+    local mute_information=""
+
+    mute_information="$(
+        timeout 5 bluealsa-cli mute "${pcm_path}" 2>/dev/null ||
+        true
+    )"
+
+    case "${mute_information}" in
+        *"L: true"*)
+            printf 'on\n'
+            ;;
+        *"L: false"*)
+            printf 'off\n'
+            ;;
+        *)
+            printf 'unavailable\n'
+            ;;
+    esac
+}
+
+set_mute() {
+    local requested_state="$1"
+    local current_state=""
+
+    require_pcm_path || return 1
+
+    if [[ "${requested_state}" == "toggle" ]]; then
+        current_state="$(read_mute_state "${current_pcm_path}")"
+
+        case "${current_state}" in
+            on)
+                requested_state="off"
+                ;;
+            off)
+                requested_state="on"
+                ;;
+            *)
+                log_error "The current mute state could not be determined."
+                return 1
+                ;;
+        esac
+    fi
+
+    case "${requested_state}" in
+        on)
+            if timeout 5 bluealsa-cli mute "${current_pcm_path}" y y; then
+                log_info "Mute enabled."
+            else
+                log_error "Failed to enable mute."
+                return 1
+            fi
+            ;;
+        off)
+            if timeout 5 bluealsa-cli mute "${current_pcm_path}" n n; then
+                log_info "Mute disabled."
+            else
+                log_error "Failed to disable mute."
+                return 1
+            fi
+            ;;
+        *)
+            log_error "Invalid mute state: ${requested_state}"
+            return 1
+            ;;
+    esac
+}
+
+connect_speaker() {
+    if timeout "${RECONNECT_TIMEOUT}" \
+        bluetoothctl connect "${SPEAKER_MAC}"; then
+        log_info "Connection requested for ${SPEAKER_NAME}."
+    else
+        log_error "Connection request failed for ${SPEAKER_NAME}."
+        return 1
+    fi
+}
+
+disconnect_speaker() {
+    if timeout "${RECONNECT_TIMEOUT}" \
+        bluetoothctl disconnect "${SPEAKER_MAC}"; then
+        log_info "Disconnection requested for ${SPEAKER_NAME}."
+    else
+        log_error "Disconnection request failed for ${SPEAKER_NAME}."
+        return 1
+    fi
+}
+
+pair_speaker() {
+    local device_information=""
+
+    device_information="$(
+        timeout 5 bluetoothctl info "${SPEAKER_MAC}" 2>/dev/null ||
+        true
+    )"
+
+    if grep -q \
+        '^[[:space:]]*Paired:[[:space:]]*yes' \
+        <<<"${device_information}"; then
+        log_info "${SPEAKER_NAME} is already paired; requesting a connection."
+        connect_audio_path
+        return
+    fi
+
+    log_info "Pairing requested. Put ${SPEAKER_NAME} into pairing mode."
+
+    timeout 45 bluetoothctl pair "${SPEAKER_MAC}" || return 1
+    timeout 10 bluetoothctl trust "${SPEAKER_MAC}" || return 1
+    connect_audio_path || return 1
+
+    log_info "Pairing completed for ${SPEAKER_NAME}."
+}
+
+publish_recovery_state() {
+    local state="$1"
+
+    publish_mqtt_value \
+        "${MQTT_CONTROL_CLIENT_ID}_publisher" \
+        "recovery" \
+        "${state}" || true
+}
+
+wait_for_pcm_path() {
+    local deadline_epoch="$1"
+
+    while (( $(date +%s) < deadline_epoch )); do
+        if [[ -n "$(find_pcm_path || true)" ]]; then
+            return 0
+        fi
+
+        sleep 2
+    done
+
+    return 1
+}
+
+start_shairport_after_connection() {
+    local deadline_epoch=""
+
+    deadline_epoch=$(($(date +%s) + RECONNECT_TIMEOUT))
+
+    if ! wait_for_pcm_path "${deadline_epoch}"; then
+        log_error "No A2DP PCM became available after connecting the speaker."
+        return 1
+    fi
+
+    if systemctl is-active --quiet "${SHAIRPORT_SERVICE}"; then
+        return 0
+    fi
+
+    if systemctl start "${SHAIRPORT_SERVICE}"; then
+        log_info "Started ${SHAIRPORT_SERVICE} after connecting the speaker."
+    else
+        log_error "Failed to start ${SHAIRPORT_SERVICE}."
+        return 1
+    fi
+}
+
+connect_audio_path() {
+    if ! speaker_is_connected; then
+        connect_speaker || return 1
+    fi
+
+    start_shairport_after_connection
+}
+
+disconnect_audio_path() {
+    local shairport_was_active=0
+
+    if systemctl is-active --quiet "${SHAIRPORT_SERVICE}"; then
+        shairport_was_active=1
+
+        if ! systemctl stop "${SHAIRPORT_SERVICE}"; then
+            log_error "Failed to stop ${SHAIRPORT_SERVICE} before disconnecting."
+            return 1
+        fi
+    fi
+
+    if disconnect_speaker; then
+        return 0
+    fi
+
+    # Restore the previous service state if the Bluetooth command failed.
+    if ((shairport_was_active == 1)); then
+        systemctl start "${SHAIRPORT_SERVICE}" || true
+    fi
+
+    return 1
+}
+
+toggle_connection() {
+    if speaker_is_connected; then
+        disconnect_audio_path
+    else
+        connect_audio_path
+    fi
+}
+
+recover_audio_path() {
+    local current_epoch=""
+    local deadline_epoch=""
+
+    current_epoch="$(date +%s)"
+
+    if ((current_epoch - last_recovery_epoch < RECOVERY_COOLDOWN)); then
+        log_error "Recovery rejected because the cooldown is still active."
+        publish_recovery_state "cooldown"
+        return 1
+    fi
+
+    last_recovery_epoch="${current_epoch}"
+    publish_recovery_state "running"
+
+    if ! speaker_is_connected; then
+        connect_speaker || true
+    fi
+
+    deadline_epoch=$((current_epoch + RECONNECT_TIMEOUT))
+
+    if ! wait_for_pcm_path "${deadline_epoch}"; then
+        log_info "No A2DP PCM is available; forcing one Bluetooth reconnect."
+
+        # The missing PCM means there is no usable output path. Stop Shairport
+        # before changing the Bluetooth connection to avoid an output-device
+        # crash if ALSA still has a stale handle open.
+        systemctl stop "${SHAIRPORT_SERVICE}" || true
+        disconnect_speaker || true
+        sleep 2
+        connect_speaker || true
+
+        deadline_epoch=$(($(date +%s) + RECONNECT_TIMEOUT))
+
+        if ! wait_for_pcm_path "${deadline_epoch}"; then
+            log_error "No A2DP PCM became available during recovery."
+            publish_recovery_state "speaker-unavailable"
+            return 1
+        fi
+    fi
+
+    if ! systemctl restart "${SHAIRPORT_SERVICE}"; then
+        log_error "Failed to restart ${SHAIRPORT_SERVICE}."
+        publish_recovery_state "restart-failed"
+        return 1
+    fi
+
+    sleep 2
+
+    if ! systemctl is-active --quiet "${SHAIRPORT_SERVICE}"; then
+        log_error "${SHAIRPORT_SERVICE} is not running after recovery."
+        publish_recovery_state "service-unavailable"
+        return 1
+    fi
+
+    log_info "Audio path recovery completed."
+    publish_recovery_state "completed"
+}
+
+process_command() {
+    local topic="$1"
+    local payload="$2"
+
+    case "${topic}:${payload}" in
+        "${MQTT_TOPIC_PREFIX}/command/volume:up")
+            change_volume up
+            ;;
+        "${MQTT_TOPIC_PREFIX}/command/volume:down")
+            change_volume down
+            ;;
+        "${MQTT_TOPIC_PREFIX}/command/mute:on")
+            set_mute on
+            ;;
+        "${MQTT_TOPIC_PREFIX}/command/mute:off")
+            set_mute off
+            ;;
+        "${MQTT_TOPIC_PREFIX}/command/mute:toggle")
+            set_mute toggle
+            ;;
+        "${MQTT_TOPIC_PREFIX}/command/connection:connect")
+            connect_audio_path
+            ;;
+        "${MQTT_TOPIC_PREFIX}/command/connection:disconnect")
+            disconnect_audio_path
+            ;;
+        "${MQTT_TOPIC_PREFIX}/command/connection:toggle")
+            toggle_connection
+            ;;
+        "${MQTT_TOPIC_PREFIX}/command/pair:pair")
+            pair_speaker
+            ;;
+        "${MQTT_TOPIC_PREFIX}/command/recover:recover")
+            recover_audio_path
+            ;;
+        *)
+            log_error "Rejected MQTT command: topic=${topic}, payload=${payload}"
+            return 1
+            ;;
+    esac
+}
+
+# -R rejects retained commands, preventing an old command from being replayed
+# after a service or broker restart.
+while IFS=$'\t' read -r command_topic command_payload; do
+    if [[ -z "${command_topic}" ]]; then
+        continue
+    fi
+
+    process_command "${command_topic}" "${command_payload}" || true
+done < <(
+    mosquitto_sub \
+        -h "${MQTT_HOST}" \
+        -p "${MQTT_PORT}" \
+        -i "${MQTT_CONTROL_CLIENT_ID}" \
+        -q 1 \
+        -R \
+        -t "${MQTT_TOPIC_PREFIX}/command/#" \
+        -F '%t\t%p'
+)

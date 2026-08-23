@@ -1,0 +1,25 @@
+[Unit]
+Description=BlueALSA MQTT control gateway
+Documentation=man:bluetoothctl(1) man:mosquitto_sub(1)
+Wants=network-online.target bluetooth.service bluealsa.service
+After=network-online.target bluetooth.service bluealsa.service
+
+[Service]
+Type=simple
+Environment=BRIDGE_COMMON_LIB=/usr/local/lib/shairport-bluealsa-mqtt-bridge/common.sh
+ExecStart=/usr/local/sbin/bluealsa-mqtt-control
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_BLUETOOTH
+
+[Install]
+WantedBy=multi-user.target

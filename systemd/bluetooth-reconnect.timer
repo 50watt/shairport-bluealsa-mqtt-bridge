@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically reconnect the configured Bluetooth audio device
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=30s
+AccuracySec=1s
+Unit=bluetooth-reconnect.service
+
+[Install]
+WantedBy=timers.target

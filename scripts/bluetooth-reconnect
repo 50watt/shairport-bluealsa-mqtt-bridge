@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+
+# Reconnect the configured Bluetooth speaker if it is currently disconnected.
+
+set -u
+
+SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIRECTORY
+readonly COMMON_LIBRARY="${BRIDGE_COMMON_LIB:-${SCRIPT_DIRECTORY}/../lib/common.sh}"
+
+if [[ ! -r "${COMMON_LIBRARY}" ]]; then
+    printf 'Common library is not readable: %s\n' "${COMMON_LIBRARY}" >&2
+    exit 1
+fi
+
+# shellcheck source=../lib/common.sh
+source "${COMMON_LIBRARY}"
+
+load_configuration || exit 1
+require_commands \
+    bluealsa-cli \
+    bluetoothctl \
+    date \
+    grep \
+    head \
+    sleep \
+    systemctl \
+    timeout || exit 1
+
+wait_for_pcm_path() {
+    local deadline_epoch="$1"
+
+    while (( $(date +%s) < deadline_epoch )); do
+        if [[ -n "$(find_pcm_path || true)" ]]; then
+            return 0
+        fi
+
+        sleep 2
+    done
+
+    return 1
+}
+
+if ! speaker_is_connected; then
+    log_info "Attempting to connect ${SPEAKER_NAME}."
+
+    if timeout "${RECONNECT_TIMEOUT}" bluetoothctl connect "${SPEAKER_MAC}"; then
+        log_info "${SPEAKER_NAME} connected successfully."
+    else
+        # A powered-off or temporarily unreachable speaker is a normal state.
+        log_info "${SPEAKER_NAME} is currently unavailable."
+        exit 0
+    fi
+else
+    # A connected speaker is the normal steady state. Continue silently so a
+    # timer can still restore Shairport Sync without generating log noise.
+    :
+fi
+
+deadline_epoch=$(($(date +%s) + RECONNECT_TIMEOUT))
+
+if ! wait_for_pcm_path "${deadline_epoch}"; then
+    log_info "The A2DP PCM path is not available yet."
+    exit 0
+fi
+
+if ! systemctl is-active --quiet "${SHAIRPORT_SERVICE}"; then
+    if systemctl start "${SHAIRPORT_SERVICE}"; then
+        log_info "Started ${SHAIRPORT_SERVICE} after reconnecting the speaker."
+    else
+        log_error "Failed to start ${SHAIRPORT_SERVICE}."
+        exit 1
+    fi
+fi
+
+exit 0

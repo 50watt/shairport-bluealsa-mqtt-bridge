@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+
+# Run lightweight repository checks without modifying the system.
+
+set -euo pipefail
+
+PROJECT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly PROJECT_DIRECTORY
+
+mapfile -t shell_files < <(
+    find "${PROJECT_DIRECTORY}" \
+        -type f \
+        \( -name '*.sh' -o -path '*/scripts/*' \) \
+        -print |
+    sort
+)
+
+for shell_file in "${shell_files[@]}"; do
+    bash -n "${shell_file}"
+done
+
+"${PROJECT_DIRECTORY}/tests/common-tests.sh"
+
+required_units=(
+    bluealsa-mqtt-control.service
+    bluealsa-mqtt-status.service
+    bluetooth-reconnect.service
+    bluetooth-reconnect.timer
+)
+
+for required_unit in "${required_units[@]}"; do
+    if [[ ! -s "${PROJECT_DIRECTORY}/systemd/${required_unit}" ]]; then
+        printf 'Missing or empty systemd unit: %s\n' "${required_unit}" >&2
+        exit 1
+    fi
+done
+
+if command -v shellcheck >/dev/null 2>&1; then
+    shellcheck -x -P SCRIPTDIR \
+        "${PROJECT_DIRECTORY}/install.sh" \
+        "${PROJECT_DIRECTORY}/uninstall.sh" \
+        "${PROJECT_DIRECTORY}/lib/common.sh" \
+        "${PROJECT_DIRECTORY}/scripts/bluealsa-mqtt-status" \
+        "${PROJECT_DIRECTORY}/scripts/bluealsa-mqtt-control" \
+        "${PROJECT_DIRECTORY}/scripts/bluetooth-reconnect" \
+        "${PROJECT_DIRECTORY}/scripts/check" \
+        "${PROJECT_DIRECTORY}/tests/common-tests.sh"
+fi
+
+printf 'All checks passed.\n'

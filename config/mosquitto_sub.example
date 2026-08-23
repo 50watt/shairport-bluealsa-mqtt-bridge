@@ -1,0 +1,5 @@
+# Copy this file to /etc/shairport-bluealsa-mqtt/mosquitto_sub.
+# Add authentication and TLS options required by the broker.
+
+# username example-user
+# password change-me
