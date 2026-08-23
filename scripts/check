@@ -20,12 +20,30 @@ for shell_file in "${shell_files[@]}"; do
 done
 
 "${PROJECT_DIRECTORY}/tests/common-tests.sh"
+"${PROJECT_DIRECTORY}/tests/interface-tests.sh"
+
+python3 - "${PROJECT_DIRECTORY}/web" <<'PYTHON'
+import ast
+import pathlib
+import sys
+
+for python_file in pathlib.Path(sys.argv[1]).rglob("*.py"):
+    ast.parse(python_file.read_text(encoding="utf-8"), filename=str(python_file))
+PYTHON
+
+if python3 -c 'import flask, werkzeug' >/dev/null 2>&1; then
+    python3 "${PROJECT_DIRECTORY}/tests/web-tests.py"
+else
+    printf 'Web authentication tests skipped: Flask is not installed.\n'
+fi
 
 required_units=(
     bluealsa-mqtt-control.service
     bluealsa-mqtt-status.service
     bluetooth-reconnect.service
     bluetooth-reconnect.timer
+    bridge-status-export.service
+    bridge-web.service
 )
 
 for required_unit in "${required_units[@]}"; do
@@ -36,15 +54,7 @@ for required_unit in "${required_units[@]}"; do
 done
 
 if command -v shellcheck >/dev/null 2>&1; then
-    shellcheck -x -P SCRIPTDIR \
-        "${PROJECT_DIRECTORY}/install.sh" \
-        "${PROJECT_DIRECTORY}/uninstall.sh" \
-        "${PROJECT_DIRECTORY}/lib/common.sh" \
-        "${PROJECT_DIRECTORY}/scripts/bluealsa-mqtt-status" \
-        "${PROJECT_DIRECTORY}/scripts/bluealsa-mqtt-control" \
-        "${PROJECT_DIRECTORY}/scripts/bluetooth-reconnect" \
-        "${PROJECT_DIRECTORY}/scripts/check" \
-        "${PROJECT_DIRECTORY}/tests/common-tests.sh"
+    shellcheck -x -P SCRIPTDIR "${shell_files[@]}"
 fi
 
 printf 'All checks passed.\n'

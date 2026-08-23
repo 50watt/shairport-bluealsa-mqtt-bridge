@@ -1,0 +1,475 @@
+#!/usr/bin/env bash
+
+# Read bridge status and run diagnostics through one stable command interface.
+
+set -uo pipefail
+
+SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIRECTORY
+
+installed_common_library="${BRIDGE_INSTALLED_COMMON_LIB:-/usr/local/lib/shairport-bluealsa-mqtt-bridge/common.sh}"
+
+if [[ -n "${BRIDGE_COMMON_LIB:-}" ]]; then
+    common_library="${BRIDGE_COMMON_LIB}"
+elif [[ -r "${installed_common_library}" ]]; then
+    common_library="${installed_common_library}"
+else
+    common_library="${SCRIPT_DIRECTORY}/../lib/common.sh"
+fi
+
+readonly COMMON_LIBRARY="${common_library}"
+readonly BRIDGE_VERSION="0.3.0-alpha.2.1"
+readonly WEB_TOKEN_FILE="/etc/shairport-bluealsa-mqtt-bridge/initial-token"
+readonly WEB_PASSWORD_FILE="/var/lib/shairport-bluealsa-mqtt-bridge/password.json"
+
+if [[ ! -r "${COMMON_LIBRARY}" ]]; then
+    printf 'Common library is not readable: %s\n' "${COMMON_LIBRARY}" >&2
+    exit 1
+fi
+
+# shellcheck source=../lib/common.sh
+source "${COMMON_LIBRARY}"
+
+json_escape() {
+    local value="$1"
+
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\t'/\\t}"
+    printf '%s' "${value}"
+}
+
+json_string() {
+    printf '"%s"' "$(json_escape "$1")"
+}
+
+json_nullable_string() {
+    if [[ -z "$1" || "$1" == "unavailable" ]]; then
+        printf 'null'
+    else
+        json_string "$1"
+    fi
+}
+
+json_nullable_number() {
+    if [[ "$1" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
+        printf '%s' "$1"
+    else
+        printf 'null'
+    fi
+}
+
+service_state() {
+    local unit_name="$1"
+    local state=""
+
+    state="$(systemctl is-active "${unit_name}" 2>/dev/null || true)"
+
+    case "${state}" in
+        active)
+            printf 'running\n'
+            ;;
+        inactive|failed|activating|deactivating)
+            printf '%s\n' "${state}"
+            ;;
+        *)
+            printf 'unavailable\n'
+            ;;
+    esac
+}
+
+determine_network_state() {
+    network_hostname="$(hostname 2>/dev/null || printf 'unavailable')"
+    network_connectivity="unavailable"
+    network_interface="unavailable"
+    network_address="unavailable"
+
+    if command -v nmcli >/dev/null 2>&1; then
+        network_connectivity="$({
+            LC_ALL=C nmcli -t -f CONNECTIVITY general 2>/dev/null || true
+        } | head -n 1)"
+    fi
+
+    if command -v ip >/dev/null 2>&1; then
+        network_interface="$(
+            ip -4 route show default 2>/dev/null |
+                awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
+        )"
+
+        if [[ -n "${network_interface}" ]]; then
+            network_address="$(
+                ip -4 -o address show dev "${network_interface}" scope global \
+                    2>/dev/null |
+                    awk '{ split($4, address, "/"); print address[1]; exit }'
+            )"
+        fi
+    fi
+
+    network_hostname="${network_hostname:-unavailable}"
+    network_connectivity="${network_connectivity:-unavailable}"
+    network_interface="${network_interface:-unavailable}"
+    network_address="${network_address:-unavailable}"
+}
+
+determine_audio_state() {
+    local delay_raw=""
+    local decoded_volume=""
+    local pcm_path=""
+    local running_property=""
+    local volume_property=""
+
+    audio_connected=0
+    audio_state="disconnected"
+    audio_profile="none"
+    audio_running=0
+    audio_volume="unavailable"
+    audio_muted="unavailable"
+    audio_delay_ms="unavailable"
+    audio_sequence="unavailable"
+
+    if [[ "${bluetooth_service_state}" != "running" ]]; then
+        audio_state="bluetooth-unavailable"
+        return
+    fi
+
+    if ! speaker_is_connected; then
+        return
+    fi
+
+    audio_connected=1
+    audio_state="connected"
+
+    if [[ "${bluealsa_service_state}" != "running" ]]; then
+        audio_state="bluealsa-unavailable"
+        return
+    fi
+
+    pcm_path="$(find_pcm_path || true)"
+
+    if [[ -z "${pcm_path}" ]]; then
+        audio_state="connected-no-audio"
+        return
+    fi
+
+    audio_profile="a2dp"
+    audio_state="audio-ready"
+    running_property="$(read_pcm_property "${pcm_path}" Running b)"
+
+    if [[ "${running_property}" == "true" ]]; then
+        audio_running=1
+        audio_state="streaming"
+    fi
+
+    delay_raw="$(read_pcm_property "${pcm_path}" Delay q)"
+    audio_sequence="$(read_pcm_property "${pcm_path}" Sequence u)"
+    volume_property="$(read_pcm_property_raw "${pcm_path}" Volume)"
+
+    if [[ "${delay_raw}" =~ ^[0-9]+$ ]]; then
+        audio_delay_ms="$(printf '%d.%d' "$((delay_raw / 10))" "$((delay_raw % 10))")"
+    fi
+
+    if ! [[ "${audio_sequence}" =~ ^[0-9]+$ ]]; then
+        audio_sequence="unavailable"
+    fi
+
+    if decoded_volume="$(decode_volume_property "${volume_property}")"; then
+        read -r audio_volume audio_muted <<<"${decoded_volume}"
+    fi
+}
+
+collect_status() {
+    configuration_state="invalid"
+    configuration_message="Configuration is incomplete or invalid."
+    speaker_name="Not configured"
+    speaker_mac="unavailable"
+
+    BLUETOOTH_SERVICE="bluetooth.service"
+    BLUEALSA_SERVICE="bluealsa.service"
+    SHAIRPORT_SERVICE="shairport-sync.service"
+
+    if source_configuration >/dev/null 2>&1; then
+        speaker_name="${SPEAKER_NAME:-Not configured}"
+        speaker_mac="${SPEAKER_MAC:-unavailable}"
+
+        if validate_configuration >/dev/null 2>&1; then
+            configuration_state="valid"
+            configuration_message="Configuration is valid."
+        fi
+    fi
+
+    bluetooth_service_state="$(service_state "${BLUETOOTH_SERVICE}")"
+    bluealsa_service_state="$(service_state "${BLUEALSA_SERVICE}")"
+    shairport_service_state="$(service_state "${SHAIRPORT_SERVICE}")"
+    mqtt_status_service_state="$(service_state bluealsa-mqtt-status.service)"
+    mqtt_control_service_state="$(service_state bluealsa-mqtt-control.service)"
+    status_export_service_state="$(service_state bridge-status-export.service)"
+    web_service_state="$(service_state bridge-web.service)"
+
+    determine_network_state
+
+    if [[ "${configuration_state}" == "valid" ]]; then
+        determine_audio_state
+    else
+        audio_connected=0
+        audio_state="not-configured"
+        audio_profile="none"
+        audio_running=0
+        audio_volume="unavailable"
+        audio_muted="unavailable"
+        audio_delay_ms="unavailable"
+        audio_sequence="unavailable"
+    fi
+
+    overall_state="ready"
+
+    if [[ "${configuration_state}" != "valid" ]]; then
+        overall_state="setup-required"
+    elif [[ "${bluetooth_service_state}" != "running" ]] ||
+         [[ "${bluealsa_service_state}" != "running" ]] ||
+         [[ "${shairport_service_state}" != "running" ]]; then
+        overall_state="degraded"
+    elif [[ "${audio_state}" == "streaming" ]]; then
+        overall_state="streaming"
+    fi
+}
+
+print_status_json() {
+    collect_status
+
+    printf '{'
+    printf '"schema_version":1,'
+    printf '"bridge_version":%s,' "$(json_string "${BRIDGE_VERSION}")"
+    printf '"generated_at":%s,' "$(json_nullable_number "$(date +%s)")"
+    printf '"overall":%s,' "$(json_string "${overall_state}")"
+    printf '"configuration":{"state":%s,"message":%s},' \
+        "$(json_string "${configuration_state}")" \
+        "$(json_string "${configuration_message}")"
+    printf '"audio":{'
+    printf '"state":%s,' "$(json_string "${audio_state}")"
+    printf '"speaker_name":%s,' "$(json_string "${speaker_name}")"
+    printf '"speaker_mac":%s,' "$(json_nullable_string "${speaker_mac}")"
+    printf '"connected":%s,' "$([[ "${audio_connected}" == 1 ]] && printf true || printf false)"
+    printf '"profile":%s,' "$(json_string "${audio_profile}")"
+    printf '"running":%s,' "$([[ "${audio_running}" == 1 ]] && printf true || printf false)"
+    printf '"volume":%s,' "$(json_nullable_number "${audio_volume}")"
+    printf '"muted":%s,' "$({
+        case "${audio_muted}" in
+            1) printf true ;;
+            0) printf false ;;
+            *) printf null ;;
+        esac
+    })"
+    printf '"delay_ms":%s,' "$(json_nullable_number "${audio_delay_ms}")"
+    printf '"sequence":%s},' "$(json_nullable_number "${audio_sequence}")"
+    printf '"network":{"hostname":%s,"connectivity":%s,"interface":%s,"address":%s},' \
+        "$(json_string "${network_hostname}")" \
+        "$(json_nullable_string "${network_connectivity}")" \
+        "$(json_nullable_string "${network_interface}")" \
+        "$(json_nullable_string "${network_address}")"
+    printf '"services":{'
+    printf '"bluetooth":%s,' "$(json_string "${bluetooth_service_state}")"
+    printf '"bluealsa":%s,' "$(json_string "${bluealsa_service_state}")"
+    printf '"shairport":%s,' "$(json_string "${shairport_service_state}")"
+    printf '"mqtt_status":%s,' "$(json_string "${mqtt_status_service_state}")"
+    printf '"mqtt_control":%s,' "$(json_string "${mqtt_control_service_state}")"
+    printf '"status_export":%s,' "$(json_string "${status_export_service_state}")"
+    printf '"web":%s}' "$(json_string "${web_service_state}")"
+    printf '}\n'
+}
+
+print_status_human() {
+    collect_status
+
+    printf '%-24s %s\n' \
+        "Bridge" "${BRIDGE_VERSION}" \
+        "Overall" "${overall_state}" \
+        "Configuration" "${configuration_state}" \
+        "Speaker" "${speaker_name}" \
+        "Bluetooth audio" "${audio_state}" \
+        "Volume" "${audio_volume}" \
+        "Network" "${network_connectivity}" \
+        "Address" "${network_address}" \
+        "Shairport Sync" "${shairport_service_state}" \
+        "BlueALSA" "${bluealsa_service_state}" \
+        "MQTT status" "${mqtt_status_service_state}" \
+        "MQTT control" "${mqtt_control_service_state}" \
+        "Web dashboard" "${web_service_state}"
+}
+
+add_doctor_check() {
+    local check_id="$1"
+    local check_status="$2"
+    local check_message="$3"
+
+    doctor_ids+=("${check_id}")
+    doctor_statuses+=("${check_status}")
+    doctor_messages+=("${check_message}")
+
+    if [[ "${check_status}" == "fail" ]]; then
+        doctor_failed=1
+    fi
+}
+
+run_doctor_checks() {
+    local command_name=""
+    local required_commands=(
+        bluealsa-cli
+        bluetoothctl
+        busctl
+        mosquitto_pub
+        mosquitto_sub
+        systemctl
+    )
+
+    doctor_ids=()
+    doctor_statuses=()
+    doctor_messages=()
+    doctor_failed=0
+
+    if source_configuration >/dev/null 2>&1 &&
+       validate_configuration >/dev/null 2>&1; then
+        add_doctor_check configuration pass "Bridge configuration is valid."
+    else
+        add_doctor_check configuration fail "Bridge configuration is incomplete or invalid."
+    fi
+
+    for command_name in "${required_commands[@]}"; do
+        if command -v "${command_name}" >/dev/null 2>&1; then
+            add_doctor_check "command-${command_name}" pass "${command_name} is available."
+        else
+            add_doctor_check "command-${command_name}" fail "${command_name} is not available."
+        fi
+    done
+
+    for command_name in "${BLUETOOTH_SERVICE:-bluetooth.service}" \
+        "${BLUEALSA_SERVICE:-bluealsa.service}" \
+        "${SHAIRPORT_SERVICE:-shairport-sync.service}"; do
+        if systemctl is-active --quiet "${command_name}"; then
+            add_doctor_check "service-${command_name}" pass "${command_name} is running."
+        else
+            add_doctor_check "service-${command_name}" fail "${command_name} is not running."
+        fi
+    done
+
+    if [[ -n "${SPEAKER_MAC:-}" ]] && speaker_is_connected; then
+        add_doctor_check bluetooth-connection pass "The configured speaker is connected."
+    else
+        add_doctor_check bluetooth-connection warn "The configured speaker is not connected."
+    fi
+
+    if [[ -n "${SPEAKER_MAC:-}" ]] && [[ -n "$(find_pcm_path || true)" ]]; then
+        add_doctor_check bluealsa-pcm pass "The configured A2DP PCM is available."
+    else
+        add_doctor_check bluealsa-pcm warn "The configured A2DP PCM is not available."
+    fi
+}
+
+print_doctor_human() {
+    local index=0
+    local symbol=""
+
+    run_doctor_checks
+
+    for index in "${!doctor_ids[@]}"; do
+        case "${doctor_statuses[index]}" in
+            pass) symbol="OK" ;;
+            warn) symbol="WARN" ;;
+            *) symbol="FAIL" ;;
+        esac
+
+        printf '%-5s %-32s %s\n' \
+            "${symbol}" \
+            "${doctor_ids[index]}" \
+            "${doctor_messages[index]}"
+    done
+
+    return "${doctor_failed}"
+}
+
+print_doctor_json() {
+    local index=0
+    local separator=""
+
+    run_doctor_checks
+
+    printf '{"schema_version":1,"bridge_version":%s,"healthy":%s,"checks":[' \
+        "$(json_string "${BRIDGE_VERSION}")" \
+        "$([[ "${doctor_failed}" == 0 ]] && printf true || printf false)"
+
+    for index in "${!doctor_ids[@]}"; do
+        printf '%s{"id":%s,"status":%s,"message":%s}' \
+            "${separator}" \
+            "$(json_string "${doctor_ids[index]}")" \
+            "$(json_string "${doctor_statuses[index]}")" \
+            "$(json_string "${doctor_messages[index]}")"
+        separator=","
+    done
+
+    printf ']}\n'
+    return "${doctor_failed}"
+}
+
+show_web_token() {
+    if [[ "${EUID}" -ne 0 ]]; then
+        log_error "Run this command as root to display the initial web token."
+        return 1
+    fi
+
+    if [[ -s "${WEB_PASSWORD_FILE}" ]]; then
+        log_error "The setup code has been replaced by a dashboard password."
+        return 1
+    fi
+
+    if [[ ! -r "${WEB_TOKEN_FILE}" ]]; then
+        log_error "The initial web token is not available."
+        return 1
+    fi
+
+    cat "${WEB_TOKEN_FILE}"
+}
+
+usage() {
+    cat <<'EOF'
+Usage:
+  bridge-config status [--json]
+  bridge-config doctor [--json]
+  bridge-config web-token
+  bridge-config version
+EOF
+}
+
+main() {
+    local command_name="${1:-}"
+    local output_format="${2:-}"
+
+    case "${command_name}:${output_format}" in
+        status:--json)
+            print_status_json
+            ;;
+        status:)
+            print_status_human
+            ;;
+        doctor:--json)
+            print_doctor_json
+            ;;
+        doctor:)
+            print_doctor_human
+            ;;
+        web-token:)
+            show_web_token
+            ;;
+        version:)
+            printf '%s\n' "${BRIDGE_VERSION}"
+            ;;
+        *)
+            usage >&2
+            return 2
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

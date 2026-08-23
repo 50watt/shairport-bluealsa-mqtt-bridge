@@ -1,0 +1,29 @@
+[Unit]
+Description=Shairport BlueALSA bridge status exporter
+Documentation=https://github.com/50watt/shairport-bluealsa-mqtt-bridge
+Wants=bluetooth.service bluealsa.service
+After=bluetooth.service bluealsa.service
+
+[Service]
+Type=simple
+User=root
+Group=bridge-web
+RuntimeDirectory=shairport-bluealsa-mqtt-bridge
+RuntimeDirectoryMode=0750
+Environment=BRIDGE_COMMON_LIB=/usr/local/lib/shairport-bluealsa-mqtt-bridge/common.sh
+ExecStart=/usr/local/sbin/bridge-status-export
+Restart=always
+RestartSec=5
+
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/run/shairport-bluealsa-mqtt-bridge
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_BLUETOOTH
+
+[Install]
+WantedBy=multi-user.target

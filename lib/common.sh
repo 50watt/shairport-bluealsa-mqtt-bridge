@@ -16,17 +16,28 @@ log_error() {
 }
 
 load_configuration() {
+    source_configuration || return 1
+    validate_configuration || return 1
+
+    export XDG_CONFIG_HOME="${MQTT_CONFIG_DIRECTORY}"
+}
+
+configuration_file() {
+    if [[ -n "${BRIDGE_CONFIG_FILE:-}" ]]; then
+        printf '%s\n' "${BRIDGE_CONFIG_FILE}"
+    elif [[ -r "${DEFAULT_CONFIG_FILE}" ]]; then
+        printf '%s\n' "${DEFAULT_CONFIG_FILE}"
+    elif [[ -r "${LEGACY_CONFIG_FILE}" ]]; then
+        printf '%s\n' "${LEGACY_CONFIG_FILE}"
+    else
+        printf '%s\n' "${DEFAULT_CONFIG_FILE}"
+    fi
+}
+
+source_configuration() {
     local config_file=""
 
-    if [[ -n "${BRIDGE_CONFIG_FILE:-}" ]]; then
-        config_file="${BRIDGE_CONFIG_FILE}"
-    elif [[ -r "${DEFAULT_CONFIG_FILE}" ]]; then
-        config_file="${DEFAULT_CONFIG_FILE}"
-    elif [[ -r "${LEGACY_CONFIG_FILE}" ]]; then
-        config_file="${LEGACY_CONFIG_FILE}"
-    else
-        config_file="${DEFAULT_CONFIG_FILE}"
-    fi
+    config_file="$(configuration_file)"
 
     if [[ ! -r "${config_file}" ]]; then
         log_error "Configuration file is not readable: ${config_file}"
@@ -36,16 +47,6 @@ load_configuration() {
     # The configuration file must only be writable by a trusted administrator.
     # shellcheck disable=SC1090
     source "${config_file}"
-
-    : "${MQTT_HOST:?MQTT_HOST is required}"
-    : "${MQTT_PORT:?MQTT_PORT is required}"
-    : "${MQTT_TOPIC_PREFIX:?MQTT_TOPIC_PREFIX is required}"
-    : "${MQTT_CONFIG_DIRECTORY:?MQTT_CONFIG_DIRECTORY is required}"
-    : "${MQTT_STATUS_CLIENT_ID:?MQTT_STATUS_CLIENT_ID is required}"
-    : "${MQTT_CONTROL_CLIENT_ID:?MQTT_CONTROL_CLIENT_ID is required}"
-    : "${BLUETOOTH_ADAPTER:?BLUETOOTH_ADAPTER is required}"
-    : "${SPEAKER_MAC:?SPEAKER_MAC is required}"
-    : "${SPEAKER_NAME:?SPEAKER_NAME is required}"
 
     POLL_INTERVAL="${POLL_INTERVAL:-5}"
     DETAIL_INTERVAL="${DETAIL_INTERVAL:-30}"
@@ -58,6 +59,28 @@ load_configuration() {
     BLUETOOTH_SERVICE="${BLUETOOTH_SERVICE:-bluetooth.service}"
     BLUEALSA_SERVICE="${BLUEALSA_SERVICE:-bluealsa.service}"
     SHAIRPORT_SERVICE="${SHAIRPORT_SERVICE:-shairport-sync.service}"
+}
+
+validate_configuration() {
+    local required_name=""
+    local required_names=(
+        MQTT_HOST
+        MQTT_PORT
+        MQTT_TOPIC_PREFIX
+        MQTT_CONFIG_DIRECTORY
+        MQTT_STATUS_CLIENT_ID
+        MQTT_CONTROL_CLIENT_ID
+        BLUETOOTH_ADAPTER
+        SPEAKER_MAC
+        SPEAKER_NAME
+    )
+
+    for required_name in "${required_names[@]}"; do
+        if [[ -z "${!required_name:-}" ]]; then
+            log_error "${required_name} is required."
+            return 1
+        fi
+    done
 
     validate_positive_integer "POLL_INTERVAL" "${POLL_INTERVAL}" || return 1
     validate_positive_integer "DETAIL_INTERVAL" "${DETAIL_INTERVAL}" || return 1
@@ -83,7 +106,6 @@ load_configuration() {
         return 1
     fi
 
-    export XDG_CONFIG_HOME="${MQTT_CONFIG_DIRECTORY}"
 }
 
 validate_positive_integer() {

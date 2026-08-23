@@ -7,6 +7,11 @@ MQTT and accepts a strict allowlist of MQTT control commands.
 The project is designed for headless Linux audio appliances, including
 Raspberry Pi systems running Shairport Sync, BlueZ, and BlueALSA.
 
+> **Development release:** `v0.3.0-alpha.2.1` adds the foundation for a guided
+> installer and web configuration interface. The first alpha provides a
+> stable status/diagnostic command and the authenticated BluePort dashboard.
+> Bluetooth and network changes are deliberately not enabled yet.
+
 ## Typical use case
 
 You have an existing Bluetooth speaker but want to use it as a network audio
@@ -40,6 +45,10 @@ topics.
 - Retained MQTT commands are rejected to prevent command replay
 - systemd hardening and automatic service restart
 - Site-specific values are stored outside the scripts
+- Human-readable and JSON status through `bridge-config status`
+- Scriptable diagnostics through `bridge-config doctor`
+- Authenticated, responsive BluePort status dashboard
+- Password change with slow hashing, confirmation, and CSRF protection
 
 ## Architecture
 
@@ -92,7 +101,24 @@ Bluetooth HCI state, and BlueALSA. The included units restrict filesystem and
 kernel access while preserving the required D-Bus, network, and Bluetooth
 interfaces.
 
-## Installation
+## Alpha bootstrap
+
+On the supported Debian 13 ARM platform, the alpha bootstrap installs the web
+runtime dependencies and starts the dashboard:
+
+```bash
+./scripts/check
+sudo ./bootstrap.sh
+```
+
+It prints a dashboard URL and a random setup code. See
+[`docs/alpha-installation.md`](docs/alpha-installation.md) for backup,
+installation, validation, and security notes.
+
+The alpha bootstrap does **not** build Shairport Sync or NQPTP yet. A complete,
+pinned AirPlay 2 source build is planned for a following alpha.
+
+## Manual bridge installation
 
 ```bash
 sudo ./install.sh
@@ -160,6 +186,47 @@ sudo systemctl enable --now bluetooth-reconnect.timer
 
 The timer checks the connection every 30 seconds. When it reconnects a speaker,
 it waits for the A2DP PCM and starts Shairport Sync if necessary.
+
+### Status and diagnostics
+
+```bash
+sudo bridge-config status
+sudo bridge-config status --json
+sudo bridge-config doctor
+sudo bridge-config doctor --json
+```
+
+The commands run as root because the site configuration and MQTT client files
+are intentionally not readable by unprivileged users. The dashboard receives a
+separate sanitized snapshot and never reads these files. The JSON documents
+include a schema version so integrations can reject future
+incompatible formats instead of silently misinterpreting fields.
+
+### BluePort dashboard
+
+Install Flask and Gunicorn before using `install.sh` directly, or use the alpha
+bootstrap to install them automatically. Then enable:
+
+```bash
+sudo systemctl enable --now \
+  bridge-status-export.service \
+  bridge-web.service
+```
+
+Open `http://PI_ADDRESS:8080/` and enter the setup code printed during the first
+installation. Display the code again locally with:
+
+```bash
+sudo bridge-config web-token
+```
+
+The first setup-code login opens a mandatory password dialog. The verified
+setup code does not need to be entered again. Choose a personal password of at
+least 8 characters; 12 or more are recommended. The password is stored as a
+slow hash and the original setup code is no longer accepted.
+
+The alpha dashboard uses plain HTTP and is intended for a trusted local network.
+Do not expose TCP port 8080 directly to the Internet.
 
 ## MQTT status topics
 

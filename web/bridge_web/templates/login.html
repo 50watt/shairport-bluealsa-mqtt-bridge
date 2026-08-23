@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Sign in · BluePort{% endblock %}
+{% block body %}
+  <main class="login-shell">
+    <section class="login-card">
+      <div class="login-brand">{% include "_brand.html" %}</div>
+      <p class="eyebrow">Shairport Sync to Bluetooth</p>
+      <h1>Welcome to BluePort</h1>
+      {% if auth_mode == 'setup-code' %}
+        <p class="muted">Enter the one-time setup code shown by the installer.</p>
+      {% else %}
+        <p class="muted">Enter your BluePort password.</p>
+      {% endif %}
+      {% if password_changed %}<p class="alert alert-success">Password changed. Sign in with your new password.</p>{% endif %}
+      {% if error %}<p class="alert alert-error">{{ error }}</p>{% endif %}
+      <form method="post" class="login-form">
+        <input name="csrf_token" type="hidden" value="{{ csrf_token() }}">
+        <label for="credential">{{ 'Setup code' if auth_mode == 'setup-code' else 'Password' }}</label>
+        <input id="credential" name="credential" type="password"
+               autocomplete="current-password" required autofocus>
+        <button type="submit">Sign in</button>
+      </form>
+    </section>
+  </main>
+{% endblock %}

@@ -13,6 +13,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install ShellCheck
-        run: sudo apt-get update && sudo apt-get install --yes shellcheck
+        run: sudo apt-get update && sudo apt-get install --yes shellcheck python3-flask
       - name: Run checks
         run: ./scripts/check

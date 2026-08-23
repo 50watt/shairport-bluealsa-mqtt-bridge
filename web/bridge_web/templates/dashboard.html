@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}Status · BluePort{% endblock %}
+{% block body %}
+  <div class="app-shell" data-status-url="{{ url_for('api_status') }}">
+    <aside class="sidebar">
+      <a class="brand" href="{{ url_for('dashboard') }}">
+        {% include "_brand.html" %}
+      </a>
+      <nav aria-label="Main navigation">
+        <a class="active" href="{{ url_for('dashboard') }}">Status</a>
+        <span class="disabled">Network <small>Coming next</small></span>
+        <span class="disabled">Speaker <small>Coming next</small></span>
+        <span class="disabled">Receiver <small>Coming next</small></span>
+        <span class="disabled">MQTT <small>Coming next</small></span>
+        <span class="disabled">Diagnostics <small>CLI available</small></span>
+      </nav>
+      <div class="account-actions">
+        <a class="text-button" href="{{ url_for('change_password') }}">Change password</a>
+        <form action="{{ url_for('logout') }}" method="post">
+          <input name="csrf_token" type="hidden" value="{{ csrf_token() }}">
+          <button class="text-button" type="submit">Sign out</button>
+        </form>
+      </div>
+    </aside>
+
+    <main class="content">
+      <header class="page-header">
+        <div>
+          <p class="eyebrow">System overview</p>
+          <h1>Audio bridge</h1>
+        </div>
+        <span id="overall-badge" class="status-badge status-{{ status.overall }}">
+          <span class="status-dot"></span><span>{{ status.overall|replace('-', ' ')|title }}</span>
+        </span>
+      </header>
+
+      <section class="hero-card">
+        <div>
+          <p class="eyebrow">Bluetooth audio</p>
+          <h2 id="speaker-name">{{ status.audio.speaker_name }}</h2>
+          <p id="audio-state" class="hero-state">{{ status.audio.state|replace('-', ' ')|title }}</p>
+        </div>
+        <div class="audio-symbol" aria-hidden="true">
+          <span></span><span></span><span></span><span></span>
+        </div>
+        <dl class="hero-metrics">
+          <div><dt>Volume</dt><dd id="audio-volume">{{ status.audio.volume if status.audio.volume is not none else '—' }}{% if status.audio.volume is not none %}%{% endif %}</dd></div>
+          <div><dt>Profile</dt><dd id="audio-profile">{{ status.audio.profile|upper }}</dd></div>
+          <div><dt>Delay</dt><dd id="audio-delay">{{ status.audio.delay_ms if status.audio.delay_ms is not none else '—' }}{% if status.audio.delay_ms is not none %} ms{% endif %}</dd></div>
+        </dl>
+      </section>
+
+      <section class="section-heading">
+        <div><p class="eyebrow">Components</p><h2>Service health</h2></div>
+        <p id="last-update" class="muted">Live status refreshes every five seconds.</p>
+      </section>
+
+      <section id="service-grid" class="card-grid">
+        {% for key, label in [('shairport', 'Shairport Sync'), ('bluealsa', 'BlueALSA'), ('bluetooth', 'Bluetooth'), ('mqtt_status', 'MQTT status'), ('mqtt_control', 'MQTT control'), ('status_export', 'Status exporter'), ('web', 'Web dashboard')] %}
+          {% set service_state = status.services.get(key, 'unavailable') %}
+          <article class="service-card" data-service="{{ key }}">
+            <span class="service-icon status-{{ service_state }}"><span class="status-dot"></span></span>
+            <div><h3>{{ label }}</h3><p>{{ service_state|replace('-', ' ')|title }}</p></div>
+          </article>
+        {% endfor %}
+      </section>
+
+      <section class="detail-grid">
+        <article class="detail-card">
+          <p class="eyebrow">Network</p>
+          <h2 id="network-hostname">{{ status.network.hostname }}</h2>
+          <dl>
+            <div><dt>Address</dt><dd id="network-address">{{ status.network.address or 'Unavailable' }}</dd></div>
+            <div><dt>Interface</dt><dd id="network-interface">{{ status.network.interface or 'Unavailable' }}</dd></div>
+            <div><dt>Connectivity</dt><dd id="network-connectivity">{{ status.network.connectivity or 'Unavailable' }}</dd></div>
+          </dl>
+        </article>
+        <article class="detail-card">
+          <p class="eyebrow">Configuration</p>
+          <h2 id="configuration-state">{{ status.configuration.state|title }}</h2>
+          <p id="configuration-message" class="muted">{{ status.configuration.message }}</p>
+          <p class="version">Bridge {{ status.bridge_version }}</p>
+        </article>
+      </section>
+    </main>
+  </div>
+  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+{% endblock %}

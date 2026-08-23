@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+
+# Export a root-generated status snapshot for the unprivileged web dashboard.
+
+set -uo pipefail
+
+readonly STATUS_DIRECTORY="${BRIDGE_STATUS_DIRECTORY:-/run/shairport-bluealsa-mqtt-bridge}"
+readonly STATUS_FILE="${BRIDGE_STATUS_FILE:-${STATUS_DIRECTORY}/status.json}"
+readonly STATUS_INTERVAL="${BRIDGE_STATUS_INTERVAL:-5}"
+readonly BRIDGE_CONFIG_COMMAND="${BRIDGE_CONFIG_COMMAND:-/usr/local/sbin/bridge-config}"
+
+if ! [[ "${STATUS_INTERVAL}" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'BRIDGE_STATUS_INTERVAL must be a positive integer.\n' >&2
+    exit 1
+fi
+
+if [[ ! -x "${BRIDGE_CONFIG_COMMAND}" ]]; then
+    printf 'bridge-config is not executable: %s\n' "${BRIDGE_CONFIG_COMMAND}" >&2
+    exit 1
+fi
+
+mkdir -p "${STATUS_DIRECTORY}"
+
+while true; do
+    temporary_file="$(mktemp "${STATUS_DIRECTORY}/status.json.XXXXXX")"
+
+    if "${BRIDGE_CONFIG_COMMAND}" status --json >"${temporary_file}"; then
+        chmod 0640 "${temporary_file}"
+        mv -f "${temporary_file}" "${STATUS_FILE}"
+    else
+        rm -f "${temporary_file}"
+        printf 'Unable to generate the bridge status snapshot.\n' >&2
+    fi
+
+    sleep "${STATUS_INTERVAL}"
+done

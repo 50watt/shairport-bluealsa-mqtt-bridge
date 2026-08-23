@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.3.0-alpha.2.1 - 2026-08-23
+
+- Make password creation mandatory immediately after the first setup-code
+  login.
+- Carry the verified setup state in the signed session instead of asking for
+  the setup code a second time or exposing it in HTML.
+- Accept passwords from 8 characters and recommend 12 or more.
+- Silence the expected missing-status warning in the isolated web test.
+
+## 0.3.0-alpha.2 - 2026-08-23
+
+- Introduce the `BluePort` dashboard identity and a purpose-built vector logo.
+- Add an authenticated password-change workflow with confirmation and CSRF
+  protection.
+- Store user passwords as slow Werkzeug password hashes in a writable systemd
+  state directory; the initial setup code becomes invalid after the change.
+
+## 0.3.0-alpha.1.2 - 2026-08-23
+
+- Quote the project-directory expansion used to derive web installation paths,
+  resolving ShellCheck SC2295.
+
+## 0.3.0-alpha.1.1 - 2026-08-23
+
+- Fix the common-library lookup for the installed `bridge-config` command.
+- Remove the undeclared `jq` dependency from the interface test suite.
+
+## 0.3.0-alpha.1 - 2026-08-23
+
+- Add `bridge-config status` with stable human-readable and JSON output.
+- Add `bridge-config doctor` with machine-readable diagnostic checks.
+- Add a root-generated runtime status snapshot for unprivileged consumers.
+- Add an authenticated, read-only Flask and Gunicorn dashboard.
+- Add responsive status, audio, service, configuration, and network views.
+- Add a Debian 13 ARM bootstrap foundation for dashboard dependencies.
+- Preserve the existing 0.2.x runtime services and configuration during an
+  alpha installation.
+- Add mocked interface tests that run without Bluetooth hardware or systemd.
+
+The alpha bootstrap does not build Shairport Sync yet and the dashboard does
+not modify Bluetooth, network, receiver, or MQTT configuration.
+
 ## 0.2.0 - 2026-08-23
 
 - Rename the project to Shairport Sync - BlueALSA MQTT Bridge so that AirPlay
